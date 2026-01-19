@@ -144,6 +144,16 @@ def normalize_url(url: Optional[str]) -> Optional[str]:
             rest = rest[5:]
         u = "https://ipfs.io/ipfs/" + rest
 
+    # cf-ipfs.com gateway -> normalize to ipfs.io (more reliable in browsers)
+    low = u.lower()
+    if low.startswith("https://cf-ipfs.com/ipfs/") or low.startswith("http://cf-ipfs.com/ipfs/"):
+        cid = u.split("/ipfs/", 1)[1]
+        u = "https://ipfs.io/ipfs/" + cid
+    elif low.startswith("https://cf-ipfs.com/ipns/") or low.startswith("http://cf-ipfs.com/ipns/"):
+        name = u.split("/ipns/", 1)[1]
+        u = "https://ipfs.io/ipns/" + name
+
+
     low = u.lower()
     if "rs.debot.ai/" in low or "debot.ai/" in low:
         u = u.split("?", 1)[0]
