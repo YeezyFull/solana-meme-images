@@ -1,254 +1,615 @@
-import csv
-import math
+#!/usr/bin/env python3
 import os
-import time
-from dataclasses import asdict
-
-import streamlit as st
-import streamlit.components.v1 as components
+import math
 import html
+import base64
+import asyncio
+from typing import Dict, Any, Optional, Tuple, List
 
-from solana.rpc.api import Client
-from solana_metadata import get_token_views_batch, TokenView
+import pandas as pd
+import streamlit as st
+import httpx
+import streamlit.components.v1 as components
+from solders.pubkey import Pubkey
 
+# ============================
+# CONFIG
+# ============================
+DATA_FILE = "token_list_with_images.csv"   # must be next to app.py
+PAGE_SIZE = 100
+COLS = 10
 
-# -----------------------------
-# UI helpers
-# -----------------------------
+# Hardcoded Helius key (as requested). You can override via env var HELIUS_API_KEY.
+HELIUS_API_KEY = "2314091d-cb57-454c-8ae0-85d261c91824"
+HELIUS_RPC_BASE = "https://mainnet.helius-rpc.com/"
+HELIUS_TIMEOUT_S = 12.0
 
-def copy_button(text: str, key: str):
-    """HTML/JS clipboard copy button (works on older Streamlit)."""
-    safe = html.escape(text)
-    bid = f"copy_{key}".replace(" ", "_").replace(":", "_").replace("/", "_")
-    components.html(
-        f"""
-        <div style="margin-top:2px;margin-bottom:6px;display:flex;gap:6px;align-items:center;">
-          <button id="{bid}" style="
-            font-size:11px;padding:4px 8px;border-radius:10px;
-            border:1px solid rgba(0,0,0,.15);background:white;cursor:pointer;">
-            Copy CA
-          </button>
-          <span id="{bid}_msg" style="font-size:11px;color:rgba(0,0,0,.55);"></span>
-        </div>
-        <script>
-          const btn = document.getElementById("{bid}");
-          const msg = document.getElementById("{bid}_msg");
-          if (btn) {{
-            btn.onclick = async () => {{
-              try {{
-                await navigator.clipboard.writeText("{safe}");
-                msg.textContent = "Copied!";
-                setTimeout(() => msg.textContent = "", 900);
-              }} catch (e) {{
-                msg.textContent = "Copy failed";
-                setTimeout(() => msg.textContent = "", 1200);
-              }}
-            }};
-          }}
-        </script>
-        """,
-        height=44,
-    )
+# Optional: override RPC used for on-chain Metaplex metadata reads
+SOLANA_RPC_URL = (os.getenv("SOLANA_RPC_URL") or "").strip() or f"{HELIUS_RPC_BASE}?api-key={os.getenv('HELIUS_API_KEY','').strip() or HELIUS_API_KEY}"
 
+# Metaplex Token Metadata program
+METADATA_PROGRAM_ID = Pubkey.from_string("metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s")
 
-def st_image_compat(url: str):
-    """Streamlit API changed from use_column_width -> use_container_width."""
-    try:
-        return st.image(url, use_container_width=True)
-    except TypeError:
-        try:
-            return st.image(url, use_column_width=True)
-        except TypeError:
-            return st.image(url)
+# Special-case replacements (local images next to app.py)
+REPLACEMENTS = [
+    ("rs.debot.ai/logo/DrZ26cKJDksVRWib3DVVsjo9eeXccc7hKhDJviiYEEZY.png", "bird.png"),
+    ("rs.debot.ai/logo/4NBTf8PfLH4oLFnwf3knv46FY9i5oXjDxffCetXRpump.png", "4NBT.png"),
+]
+LOCAL_SENT_PREFIX = "__LOCAL__:"  # sentinel used internally
 
+# ============================
+# STYLE (YZY vibe)
+# ============================
+CSS = """
+<style>
+.main .block-container { max-width: 1320px; padding-top: 18px; }
+body { background: #ffffff; }
+.yzy-title { text-align:center; margin-top: 6px; }
+.yzy-title h1 { font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Arial; letter-spacing: .18em; font-weight: 800; margin: 0; }
+.yzy-title h2 { font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Arial; letter-spacing: .14em; font-weight: 600; font-size: 12px; margin: 6px 0 0 0; color:#111; }
+.smallcap { color:#666; font-size: 12px; text-align:left; margin: 10px 0 12px 2px; }
 
-def safe_str(x, fallback="—"):
-    if x is None:
-        return fallback
+.token-card { border: 1px solid #d9d9d9; border-radius: 14px; padding: 10px 10px 12px 10px; background: #fff; }
+.token-top { display:flex; gap:8px; align-items:flex-start; justify-content:space-between; }
+.token-sym { font-weight: 800; letter-spacing: .06em; font-size: 12px; color: #111; line-height: 1.1; }
+.token-name { font-size: 11px; color:#444; margin-top: 2px; line-height: 1.15; overflow:hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.token-img { margin-top: 8px; width: 100%; height: 116px; border: 1px solid #ededed; border-radius: 10px; display:flex; align-items:center; justify-content:center; overflow:hidden; background: #fafafa; }
+.token-img img { width:100%; height:100%; object-fit: contain; }
+.noimg { font-size: 10px; color: #666; padding: 8px; text-align:center; line-height: 1.2; }
+
+.token-meta { margin-top: 8px; font-size: 10px; color:#333; line-height: 1.2; }
+.token-ca { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }
+.token-date { color:#666; margin-top: 3px; }
+
+.copybtn-wrap { margin-top: 8px; }
+</style>
+"""
+
+# ============================
+# HELPERS
+# ============================
+def short_ca(ca: str) -> str:
+    ca = (ca or "").strip()
+    if len(ca) <= 10:
+        return ca
+    return f"{ca[:4]}…{ca[-4:]}"
+
+def nonempty_str(x) -> Optional[str]:
     if isinstance(x, str):
-        s = x.strip()
-        if not s or s == "0" or s.lower() in ("null", "none"):
-            return fallback
-        return s
-    return fallback
+        t = x.strip()
+        if t and t not in ("0", "null", "None", "none"):
+            return t
+    return None
 
+@st.cache_data(show_spinner=False)
+def load_local_image_b64(filename: str) -> Optional[str]:
+    try:
+        with open(filename, "rb") as f:
+            b = f.read()
+        ext = filename.lower().split(".")[-1]
+        mime = "image/png"
+        if ext in ("jpg", "jpeg"):
+            mime = "image/jpeg"
+        elif ext == "webp":
+            mime = "image/webp"
+        data = base64.b64encode(b).decode("ascii")
+        return f"data:{mime};base64,{data}"
+    except Exception:
+        return None
 
-def load_mints_from_csv(path: str) -> list[str]:
-    mints: list[str] = []
-    if not os.path.exists(path):
-        return mints
+@st.cache_data(show_spinner=False)
+def local_images_map() -> Dict[str, Optional[str]]:
+    m = {}
+    for _, fn in REPLACEMENTS:
+        m[fn] = load_local_image_b64(fn)
+    return m
 
-    with open(path, "r", newline="", encoding="utf-8") as f:
-        # Accept either: single-column CSV, or any CSV containing something that looks like base58 mint
-        reader = csv.reader(f)
-        for row in reader:
-            for cell in row:
-                c = (cell or "").strip()
-                if c and len(c) >= 32:
-                    mints.append(c)
-                    break
-    # de-dup preserve order
-    seen = set()
-    out = []
-    for m in mints:
-        if m in seen:
-            continue
-        seen.add(m)
-        out.append(m)
+def apply_replacements(url: Optional[str]) -> Optional[str]:
+    if not url:
+        return None
+    u = str(url).strip()
+    low = u.lower()
+    for substr, local_fn in REPLACEMENTS:
+        if substr.lower() in low:
+            return f"{LOCAL_SENT_PREFIX}{local_fn}"
+    return u
+
+def normalize_url(url: Optional[str]) -> Optional[str]:
+    if not url:
+        return None
+    u = str(url).strip()
+    if not u:
+        return None
+
+    u = apply_replacements(u) or u
+    if u.startswith(LOCAL_SENT_PREFIX):
+        return u
+
+    low = u.lower()
+
+    if "cdn-cgi/image" in low:
+        last_https = low.rfind("https://")
+        last_http = low.rfind("http://")
+        last = max(last_https, last_http)
+        if last != -1:
+            u = u[last:]
+
+    if u.startswith("//"):
+        u = "https:" + u
+
+    if u.lower().startswith("ipfs://"):
+        rest = u[7:].lstrip("/")
+        if rest.lower().startswith("ipfs/"):
+            rest = rest[5:]
+        u = "https://ipfs.io/ipfs/" + rest
+
+    low = u.lower()
+    if "rs.debot.ai/" in low or "debot.ai/" in low:
+        u = u.split("?", 1)[0]
+
+    u = apply_replacements(u) or u
+    return u
+
+def is_local_sent(u: Optional[str]) -> bool:
+    return bool(u) and str(u).startswith(LOCAL_SENT_PREFIX)
+
+def local_sent_to_data_uri(u: str, local_map: Dict[str, Optional[str]]) -> Optional[str]:
+    fn = u[len(LOCAL_SENT_PREFIX):]
+    return local_map.get(fn)
+
+def helius_url() -> str:
+    key = (os.getenv("HELIUS_API_KEY") or "").strip() or HELIUS_API_KEY
+    return f"{HELIUS_RPC_BASE}?api-key={key}"
+
+def _extract_image_from_json(j: Dict[str, Any]) -> Optional[str]:
+    for k in ("image", "image_url", "imageUrl", "logoURI", "logoUri", "animation_url", "animationUrl"):
+        v = j.get(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    ext = j.get("extensions")
+    if isinstance(ext, dict):
+        v = ext.get("image")
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    props = j.get("properties")
+    if isinstance(props, dict):
+        files = props.get("files")
+        if isinstance(files, list):
+            for f in files:
+                if isinstance(f, dict):
+                    v = f.get("uri") or f.get("url")
+                    if isinstance(v, str) and v.strip():
+                        return v.strip()
+    return None
+
+# ============================
+# HELIUS FALLBACK
+# ============================
+def _extract_helius_image(asset: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
+    content = asset.get("content") or {}
+    json_uri = None
+    if isinstance(content, dict):
+        files = content.get("files")
+        if isinstance(files, list) and files:
+            f0 = files[0] if isinstance(files[0], dict) else None
+            if isinstance(f0, dict):
+                img = nonempty_str(f0.get("cdn_uri")) or nonempty_str(f0.get("uri"))
+                img = normalize_url(img)
+                if img:
+                    return img, None
+        links = content.get("links")
+        if isinstance(links, dict):
+            img = normalize_url(nonempty_str(links.get("image")))
+            if img:
+                return img, None
+        json_uri = normalize_url(nonempty_str(content.get("json_uri")))
+    if json_uri:
+        return None, "Helius: no direct image, has json_uri"
+    return None, "Helius: asset has no image fields"
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def helius_get_asset_batch(mints: List[str]) -> Dict[str, Dict[str, Any]]:
+    if not mints:
+        return {}
+    url = helius_url()
+    out: Dict[str, Dict[str, Any]] = {}
+    headers = {"Content-Type": "application/json"}
+
+    with httpx.Client(timeout=HELIUS_TIMEOUT_S, follow_redirects=True) as client:
+        for i in range(0, len(mints), 100):
+            ids = mints[i:i + 100]
+            payload = {"jsonrpc": "2.0", "id": "1", "method": "getAssetBatch", "params": {"ids": ids}}
+            try:
+                r = client.post(url, json=payload, headers=headers)
+                r.raise_for_status()
+                data = r.json()
+                assets = data.get("result")
+                if not isinstance(assets, list):
+                    continue
+
+                json_needed: List[Tuple[str, str]] = []
+                for a in assets:
+                    if not isinstance(a, dict):
+                        continue
+                    mint = a.get("id")
+                    if not isinstance(mint, str):
+                        continue
+                    img, reason = _extract_helius_image(a)
+                    content = a.get("content") or {}
+                    json_uri = normalize_url(nonempty_str(content.get("json_uri"))) if isinstance(content, dict) else None
+                    out[mint] = {"image": img, "json_uri": json_uri, "reason": reason}
+                    if (not img) and json_uri:
+                        json_needed.append((mint, json_uri))
+
+                for mint, jurl in json_needed:
+                    try:
+                        jr = client.get(jurl, headers={"Accept": "application/json,*/*"})
+                        jr.raise_for_status()
+                        ctype = (jr.headers.get("content-type") or "").lower()
+                        if ctype.startswith("image/"):
+                            out[mint]["image"] = normalize_url(jurl)
+                            out[mint]["reason"] = None
+                            continue
+                        if "text/html" in ctype or "<html" in jr.text[:200].lower():
+                            continue
+                        jj = jr.json()
+                        img2 = normalize_url(_extract_image_from_json(jj))
+                        if img2:
+                            out[mint]["image"] = img2
+                            out[mint]["reason"] = None
+                    except Exception:
+                        continue
+
+            except Exception as e:
+                for mint in ids:
+                    out[mint] = {"image": None, "json_uri": None, "reason": f"Helius error: {type(e).__name__}"}
+
     return out
 
+# ============================
+# METAPLEX (ON-CHAIN) FALLBACK
+# ============================
+def metadata_pda_for_mint(mint_str: str) -> Pubkey:
+    mint = Pubkey.from_string(mint_str)
+    seeds = [b"metadata", bytes(METADATA_PROGRAM_ID), bytes(mint)]
+    pda, _ = Pubkey.find_program_address(seeds, METADATA_PROGRAM_ID)
+    return pda
 
-# -----------------------------
-# App
-# -----------------------------
+def _extract_first_uri_from_bytes(b: bytes) -> Optional[str]:
+    needles = [b"https://", b"http://", b"ipfs://"]
+    idx = -1
+    for n in needles:
+        i = b.find(n)
+        if i != -1 and (idx == -1 or i < idx):
+            idx = i
+    if idx == -1:
+        return None
+    end = b.find(b"\x00", idx)
+    if end == -1:
+        end = min(len(b), idx + 400)
+    raw = b[idx:end]
+    try:
+        s = raw.decode("utf-8", errors="ignore").strip()
+        s = s.split()[0]
+        return s
+    except Exception:
+        return None
 
-st.set_page_config(page_title="Token Images", layout="wide")
+async def _rpc_get_account_data_base64(client: httpx.AsyncClient, pubkey: str) -> Optional[bytes]:
+    payload = {
+        "jsonrpc": "2.0",
+        "id": "1",
+        "method": "getAccountInfo",
+        "params": [pubkey, {"encoding": "base64"}],
+    }
+    r = await client.post(SOLANA_RPC_URL, json=payload)
+    r.raise_for_status()
+    j = r.json()
+    v = (j.get("result") or {}).get("value")
+    if not v:
+        return None
+    data = v.get("data")
+    if not (isinstance(data, list) and len(data) >= 1 and isinstance(data[0], str)):
+        return None
+    return base64.b64decode(data[0])
 
-# Minimal CSS for dense grid
-st.markdown(
-    """
-    <style>
-      .block-container { padding-top: 10px; padding-bottom: 10px; }
-      [data-testid="stCaptionContainer"] p { margin-bottom: 0.15rem; }
-      .tiny { font-size: 11px; color: rgba(0,0,0,.65); }
-      .mint { font-size: 11px; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }
-      .tile { border: 1px dashed rgba(0,0,0,.18); border-radius: 14px; padding: 6px; }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
+async def _fetch_json_or_image(client: httpx.AsyncClient, uri: str) -> Tuple[Optional[str], Optional[str]]:
+    u = normalize_url(uri)
+    if not u:
+        return None, "Metaplex: empty uri"
+    try:
+        r = await client.get(u, headers={"Accept": "application/json,*/*"})
+        r.raise_for_status()
+        ctype = (r.headers.get("content-type") or "").lower()
+        if ctype.startswith("image/"):
+            return normalize_url(u), None
+        txt_head = (r.text or "")[:200].lower()
+        if "text/html" in ctype or "<html" in txt_head:
+            return None, "Metaplex: token URI returned HTML"
+        jj = r.json()
+        img = normalize_url(_extract_image_from_json(jj))
+        if img:
+            return img, None
+        return None, "Metaplex: JSON has no image field"
+    except Exception as e:
+        return None, f"Metaplex: failed to fetch token JSON ({type(e).__name__})"
 
-st.title("Token images (Metaplex → URI → JSON → image)")
+@st.cache_data(show_spinner=False, ttl=3600)
+def metaplex_resolve_images(mints: List[str]) -> Dict[str, Dict[str, Any]]:
+    if not mints:
+        return {}
 
-show_debug = st.checkbox("Show debug details (status / source / URL / error)", value=False)
+    async def run() -> Dict[str, Dict[str, Any]]:
+        out: Dict[str, Dict[str, Any]] = {}
+        sem = asyncio.Semaphore(18)
+        async with httpx.AsyncClient(timeout=HELIUS_TIMEOUT_S, follow_redirects=True) as client:
+            async def one(m: str):
+                async with sem:
+                    try:
+                        pda = metadata_pda_for_mint(m)
+                        b = await _rpc_get_account_data_base64(client, str(pda))
+                        if not b:
+                            out[m] = {"image": None, "reason": "Metaplex: no metadata account"}
+                            return
+                        uri = _extract_first_uri_from_bytes(b)
+                        if not uri:
+                            out[m] = {"image": None, "reason": "Metaplex: no token URI in metadata bytes"}
+                            return
+                        img, reason = await _fetch_json_or_image(client, uri)
+                        if img:
+                            out[m] = {"image": img, "reason": None}
+                        else:
+                            out[m] = {"image": None, "reason": reason or "Metaplex: no image"}
+                    except Exception as e:
+                        out[m] = {"image": None, "reason": f"Metaplex error: {type(e).__name__}"}
 
-csv_path = os.path.join(os.path.dirname(__file__), "full.csv")
-mints_all = load_mints_from_csv(csv_path)
+            await asyncio.gather(*[one(m) for m in mints])
+        return out
 
-if not mints_all:
-    st.error("full.csv not found or empty. Put full.csv next to app.py.")
+    try:
+        return asyncio.run(run())
+    except RuntimeError:
+        # event loop already running -> fallback sequential
+        out: Dict[str, Dict[str, Any]] = {}
+        with httpx.Client(timeout=HELIUS_TIMEOUT_S, follow_redirects=True) as c:
+            for m in mints:
+                try:
+                    pda = metadata_pda_for_mint(m)
+                    payload = {"jsonrpc":"2.0","id":"1","method":"getAccountInfo","params":[str(pda),{"encoding":"base64"}]}
+                    r = c.post(SOLANA_RPC_URL, json=payload)
+                    r.raise_for_status()
+                    j = r.json()
+                    v = (j.get("result") or {}).get("value")
+                    if not v:
+                        out[m] = {"image": None, "reason": "Metaplex: no metadata account"}
+                        continue
+                    data = v.get("data")
+                    if not (isinstance(data, list) and isinstance(data[0], str)):
+                        out[m] = {"image": None, "reason": "Metaplex: bad account data"}
+                        continue
+                    b = base64.b64decode(data[0])
+                    uri = _extract_first_uri_from_bytes(b)
+                    if not uri:
+                        out[m] = {"image": None, "reason": "Metaplex: no token URI in metadata bytes"}
+                        continue
+                    u = normalize_url(uri)
+                    rr = c.get(u, headers={"Accept":"application/json,*/*"})
+                    rr.raise_for_status()
+                    ctype = (rr.headers.get("content-type") or "").lower()
+                    if ctype.startswith("image/"):
+                        out[m] = {"image": normalize_url(u), "reason": None}
+                        continue
+                    if "text/html" in ctype or "<html" in (rr.text or "")[:200].lower():
+                        out[m] = {"image": None, "reason": "Metaplex: token URI returned HTML"}
+                        continue
+                    jj = rr.json()
+                    img = normalize_url(_extract_image_from_json(jj))
+                    if img:
+                        out[m] = {"image": img, "reason": None}
+                    else:
+                        out[m] = {"image": None, "reason": "Metaplex: JSON has no image field"}
+                except Exception as e:
+                    out[m] = {"image": None, "reason": f"Metaplex error: {type(e).__name__}"}
+        return out
+
+# ============================
+# DATA
+# ============================
+@st.cache_data(show_spinner=False)
+def load_tokens(csv_path: str) -> pd.DataFrame:
+    df = pd.read_csv(csv_path)
+    needed = ["symbol", "name", "ca", "mint_time", "image_url"]
+    missing = [c for c in needed if c not in df.columns]
+    if missing:
+        raise RuntimeError(f"CSV missing columns {missing}. Found: {df.columns.tolist()}")
+
+    out = df[needed].copy()
+    out["ca"] = out["ca"].astype(str).str.strip()
+    out["symbol"] = out["symbol"].astype(str).fillna("").str.strip()
+    out["name"] = out["name"].astype(str).fillna("").str.strip()
+    out["mint_time"] = out["mint_time"].astype(str).fillna("").str.strip()
+
+    out["image_url"] = out["image_url"].astype(str).where(df["image_url"].notna(), "").str.strip()
+    out["image_url"] = out["image_url"].apply(lambda x: normalize_url(nonempty_str(x)) or "")
+
+    out["mint_dt"] = pd.to_datetime(out["mint_time"], errors="coerce", utc=False)
+    out["mint_date"] = out["mint_dt"].dt.date
+
+    out = out[out["ca"].str.len() > 0].drop_duplicates(subset=["ca"], keep="first").reset_index(drop=True)
+    return out
+
+# ============================
+# COPY BUTTON (no rerun)
+# ============================
+def copy_button_html(text: str, key: str) -> str:
+    btn_id = f"btn_{key}"
+    safe_text_js = text.replace("\\", "\\\\").replace('"', '\\"')
+    return f"""
+<div class="copybtn-wrap">
+  <button id="{btn_id}" style="
+    border-radius:999px; border:1px solid #d9d9d9; background:#fff; color:#111;
+    font-size:11px; padding:4px 10px; cursor:pointer;">
+    Copy CA
+  </button>
+  <span id="{btn_id}_msg" style="font-size:11px; color:#666; margin-left:8px;"></span>
+</div>
+<script>
+  const btn = document.getElementById("{btn_id}");
+  const msg = document.getElementById("{btn_id}_msg");
+  btn.addEventListener("click", async () => {{
+    try {{
+      await navigator.clipboard.writeText("{safe_text_js}");
+      msg.textContent = "Copied ✓";
+      setTimeout(()=>{{ msg.textContent=""; }}, 1200);
+    }} catch (e) {{
+      msg.textContent = "Copy blocked";
+      setTimeout(()=>{{ msg.textContent=""; }}, 1500);
+    }}
+  }});
+</script>
+"""
+
+def image_box_html(img_url: Optional[str], reason: str, key: str, local_map: Dict[str, Optional[str]]) -> str:
+    safe_reason = html.escape(reason)
+    url_to_use = img_url
+    if img_url and is_local_sent(img_url):
+        data_uri = local_sent_to_data_uri(img_url, local_map)
+        url_to_use = data_uri if data_uri else None
+
+    if url_to_use:
+        safe_url = html.escape(url_to_use)
+        return f"""
+<div class="token-img" id="imgwrap_{key}">
+  <img src="{safe_url}" loading="lazy"
+       onerror="this.onerror=null; const p=this.parentElement; p.innerHTML='<div class=\\'noimg\\'>{safe_reason}</div>';" />
+</div>
+"""
+    return f'<div class="token-img"><div class="noimg">{safe_reason}</div></div>'
+
+# ============================
+# APP
+# ============================
+st.set_page_config(page_title="YZY-TKNS", layout="wide")
+st.markdown(CSS, unsafe_allow_html=True)
+st.markdown('<div class="yzy-title"><h1>YZY TKNS</h1><h2>THE ARCHIVE</h2></div>', unsafe_allow_html=True)
+
+local_map = local_images_map()
+
+try:
+    df = load_tokens(DATA_FILE)
+except Exception as e:
+    st.error(f"Couldn't load {DATA_FILE}. Put it next to app.py. Error: {e}")
     st.stop()
 
-PAGE_SIZE = 100
-cols_per_row = 10
+cA, cB, cC, cD = st.columns([2.2, 2.2, 3.2, 2.4])
+with cA:
+    sort_mode = st.selectbox("Sort", options=["Newest", "Oldest"], index=0)
+with cB:
+    show_only_images = st.checkbox("Show only tokens with images", value=False)
+with cC:
+    picked_date = st.date_input("Mint date (optional)", value=None, help="Pick a day to show tokens minted that day.")
+with cD:
+    page = st.number_input("Page", min_value=1, max_value=999999, value=1, step=1)
 
-total = len(mints_all)
+search_q = st.text_input("Search (symbol / name / CA)", value="", placeholder="Search token…")
+
+f = df.copy()
+if search_q.strip():
+    q = search_q.strip().lower()
+    f = f[
+        f["symbol"].str.lower().str.contains(q)
+        | f["name"].str.lower().str.contains(q)
+        | f["ca"].str.lower().str.contains(q)
+    ]
+if picked_date is not None:
+    f = f[f["mint_date"] == picked_date]
+if show_only_images:
+    f = f[f["image_url"].astype(str).str.strip() != ""]
+
+if sort_mode == "Newest":
+    f = f.sort_values(by=["mint_dt", "mint_time"], ascending=False)
+else:
+    f = f.sort_values(by=["mint_dt", "mint_time"], ascending=True)
+
+f = f.reset_index(drop=True)
+total = len(f)
 pages = max(1, math.ceil(total / PAGE_SIZE))
+page = max(1, min(int(page), pages))
 
-c1, c2, c3, c4 = st.columns([1.1, 1, 1, 2.5])
-with c1:
-    page = st.number_input("Page", min_value=1, max_value=pages, value=1, step=1)
-with c2:
-    rpc_url = st.text_input("RPC", value="https://api.mainnet-beta.solana.com")
-with c3:
-    st.write(f"Total: **{total:,}**")
-    st.write(f"Pages: **{pages:,}**")
-with c4:
-    st.write("")
+st.markdown(f'<div class="smallcap">Total tokens: <b>{total:,}</b> • Page: <b>{page:,}/{pages:,}</b> • Items per page: <b>{PAGE_SIZE}</b></div>', unsafe_allow_html=True)
 
 start = (page - 1) * PAGE_SIZE
-end = min(total, start + PAGE_SIZE)
-page_mints = mints_all[start:end]
+end = min(start + PAGE_SIZE, total)
+page_df = f.iloc[start:end].copy()
 
-client = Client(rpc_url)
+missing = page_df[page_df["image_url"].astype(str).str.strip() == ""]["ca"].tolist()
+helius_map: Dict[str, Dict[str, Any]] = {}
+if missing:
+    with st.spinner(f"Fetching missing images from Helius ({len(missing)})…"):
+        helius_map = helius_get_asset_batch(missing)
 
-progress = st.progress(0)
-status_placeholder = st.empty()
+still_missing = []
+for m in missing:
+    img = normalize_url(nonempty_str((helius_map.get(m) or {}).get("image")))
+    if not img:
+        still_missing.append(m)
 
-# Fetch in chunks to keep UI responsive
-CHUNK = 50
-results: list[TokenView] = []
-t0 = time.time()
+metaplex_map: Dict[str, Dict[str, Any]] = {}
+if still_missing:
+    with st.spinner(f"Trying Metaplex on-chain metadata ({len(still_missing)})…"):
+        metaplex_map = metaplex_resolve_images(still_missing)
 
-for i in range(0, len(page_mints), CHUNK):
-    chunk = page_mints[i:i+CHUNK]
-    status_placeholder.caption(f"Fetching {i+1}-{min(i+len(chunk), len(page_mints))} / {len(page_mints)} …")
-    try:
-        tvs = get_token_views_batch(client, chunk)
-    except Exception as e:
-        tvs = [TokenView(mint=m, status="error", error=str(e)) for m in chunk]
-    results.extend(tvs)
-    progress.progress(min(1.0, (i + len(chunk)) / max(1, len(page_mints))))
+items = page_df.to_dict(orient="records")
 
-dt = time.time() - t0
-status_placeholder.caption(f"Done in {dt:.1f}s. Images: {sum(1 for r in results if r.image)} / {len(results)}")
-progress.empty()
+for r in range(0, len(items), COLS):
+    cols = st.columns(COLS)
+    for j in range(COLS):
+        idx = r + j
+        if idx >= len(items):
+            continue
+        it = items[idx]
 
-# Breakdown
-status_counts = {}
-http_counts = {}
-source_counts = {}
-for r in results:
-    status_counts[r.status] = status_counts.get(r.status, 0) + 1
-    src = getattr(r, "source", "none")
-    source_counts[src] = source_counts.get(src, 0) + 1
-    if getattr(r, "http_status", None):
-        code = int(r.http_status)
-        http_counts[code] = http_counts.get(code, 0) + 1
+        ca = str(it.get("ca", "")).strip()
+        sym = str(it.get("symbol", "")).strip()
+        nm = str(it.get("name", "")).strip()
+        mint_time = str(it.get("mint_time", "")).strip()
 
-st.caption("Status breakdown: " + ", ".join([f"**{k}**: {v}" for k, v in sorted(status_counts.items(), key=lambda x: (-x[1], x[0]))]))
-st.caption("Source breakdown: " + ", ".join([f"**{k}**: {v}" for k, v in sorted(source_counts.items(), key=lambda x: (-x[1], x[0]))]))
-if http_counts:
-    st.caption("HTTP status breakdown: " + ", ".join([f"**{k}**: {v}" for k, v in sorted(http_counts.items())]))
+        img = normalize_url(nonempty_str(it.get("image_url", "")))
 
-st.divider()
+        reason = "Image failed to load"
+        if not img:
+            img = normalize_url(nonempty_str((helius_map.get(ca) or {}).get("image")))
+            reason = (helius_map.get(ca) or {}).get("reason") or reason
 
-# Render 10x10 grid
-rows = math.ceil(len(results) / cols_per_row)
+            if not img:
+                img = normalize_url(nonempty_str((metaplex_map.get(ca) or {}).get("image")))
+                reason = (metaplex_map.get(ca) or {}).get("reason") or reason
 
-idx = 0
-for r in range(rows):
-    cols = st.columns(cols_per_row, gap="small")
-    for c in range(cols_per_row):
-        if idx >= len(results):
-            break
-        tv = results[idx]
-        idx += 1
+            if not img:
+                reason = "No image URL in list (Helius + Metaplex failed)"
+        else:
+            if is_local_sent(img):
+                reason = "Image replaced locally"
 
-        with cols[c]:
-            # Tile container
-            st.markdown('<div class="tile">', unsafe_allow_html=True)
+        key = f"{page}_{idx}"
 
-            img_url = tv.image if isinstance(tv.image, str) else None
-            render_err = None
-            if img_url and img_url.strip() and img_url.strip() != "0":
-                try:
-                    st_image_compat(img_url)
-                except Exception as e:
-                    render_err = str(e)
-                    # If rendering fails, show placeholder
-                    st.markdown('<div style="height:120px;"></div>', unsafe_allow_html=True)
-            else:
-                st.markdown('<div style="height:120px;"></div>', unsafe_allow_html=True)
-
-            sym = safe_str(tv.symbol, fallback="—")
-            st.markdown(f"**{sym}**", help=safe_str(tv.name, fallback=""))
-
-            mint = tv.mint
-            short = mint[:4] + "…" + mint[-4:] if isinstance(mint, str) and len(mint) > 12 else mint
-            st.markdown(f'<div class="mint" title="{html.escape(mint)}">{html.escape(short)}</div>', unsafe_allow_html=True)
-
-            copy_button(mint, key=f"{page}_{r}_{c}_{idx}")
-
-            if show_debug and (tv.status != "ok" or render_err is not None):
-                st.markdown(
-                    f'<div class="tiny">'
-                    f'status={html.escape(str(tv.status))} '
-                    f'source={html.escape(str(getattr(tv,"source","?")))} '
-                    f'code={html.escape(str(getattr(tv,"http_status", "")))}'
-                    f'</div>',
-                    unsafe_allow_html=True,
-                )
-                if render_err:
-                    st.markdown(f'<div class="tiny">render_err: {html.escape(render_err[:140])}</div>', unsafe_allow_html=True)
-                if getattr(tv, "uri", None):
-                    u = str(tv.uri)
-                    st.markdown(f'<div class="tiny">uri: {html.escape(u[:120])}{"…" if len(u)>120 else ""}</div>', unsafe_allow_html=True)
-                if getattr(tv, "last_url", None):
-                    u = str(tv.last_url)
-                    st.markdown(f'<div class="tiny">url: {html.escape(u[:120])}{"…" if len(u)>120 else ""}</div>', unsafe_allow_html=True)
-                if getattr(tv, "error", None):
-                    e = str(tv.error)
-                    st.markdown(f'<div class="tiny">err: {html.escape(e[:140])}{"…" if len(e)>140 else ""}</div>', unsafe_allow_html=True)
-
-            st.markdown("</div>", unsafe_allow_html=True)
+        card_html = f"""
+<div class="token-card">
+  <div class="token-top">
+    <div>
+      <div class="token-sym">{html.escape(sym or "—")}</div>
+      <div class="token-name">{html.escape(nm or "")}</div>
+    </div>
+  </div>
+  {image_box_html(img, reason, key, local_map)}
+  <div class="token-meta">
+    <div class="token-ca">{html.escape(short_ca(ca))}</div>
+    <div class="token-date">{html.escape(mint_time)}</div>
+  </div>
+</div>
+"""
+        with cols[j]:
+            st.markdown(card_html, unsafe_allow_html=True)
+            components.html(copy_button_html(ca, key=f"{key}_{j}"), height=44)
+            st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
