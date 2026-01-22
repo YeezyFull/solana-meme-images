@@ -702,6 +702,6 @@ with stats_tab:
 with chain_tab:
     st.markdown('<div class="yzy-title"><h1>YZY BLOCKCHAIN</h1><h2>COMING SOON</h2></div>', unsafe_allow_html=True)
     try:
-        st.image('soon.png', use_container_width=True)
+        st.image('soon1.png', use_container_width=True)
     except Exception:
-        st.info('soon.png not found ')
+        st.info('soon1.png not found ')
