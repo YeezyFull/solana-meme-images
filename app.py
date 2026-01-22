@@ -3,6 +3,7 @@ import os
 import math
 import html
 import base64
+import textwrap
 import asyncio
 import datetime as dt
 from typing import Dict, Any, Optional, Tuple, List
@@ -528,7 +529,7 @@ if _qdate:
     except Exception:
         _default_date = None
 
-archive_tab, stats_tab = st.tabs(["Archive", "Statistic"])
+archive_tab, stats_tab, chain_tab = st.tabs(["Archive", "Statistic", "YZY BLOCKCHAIN"])
 
 with archive_tab:
     cA, cB, cC, cD = st.columns([2.2, 2.2, 3.2, 2.4])
@@ -631,21 +632,21 @@ with archive_tab:
 
             key = f"{page}_{idx}"
 
-            card_html = f"""
-<div class="token-card">
-  <div class="token-top">
-    <div>
-      <div class="token-sym">{html.escape(sym or "—")}</div>
-      <div class="token-name">{html.escape(nm or "")}</div>
+            card_html = textwrap.dedent(f"""
+    <div class="token-card">
+      <div class="token-top">
+        <div>
+          <div class="token-sym">{html.escape(sym or "—")}</div>
+          <div class="token-name">{html.escape(nm or "")}</div>
+        </div>
+      </div>
+      {image_box_html(img, reason, key, local_map).strip()}
+      <div class="token-meta">
+        <div class="token-ca">{html.escape(short_ca(ca))}</div>
+        <div class="token-date">{html.escape(mint_time)}</div>
+      </div>
     </div>
-  </div>
-  {image_box_html(img, reason, key, local_map)}
-  <div class="token-meta">
-    <div class="token-ca">{html.escape(short_ca(ca))}</div>
-    <div class="token-date">{html.escape(mint_time)}</div>
-  </div>
-</div>
-"""
+""").strip()
             with cols[j]:
                 st.markdown(card_html, unsafe_allow_html=True)
                 components.html(copy_button_html(ca, key=f"{key}_{j}"), height=44)
@@ -697,3 +698,10 @@ with stats_tab:
 </div>
 '''
             st.markdown(row_html, unsafe_allow_html=True)
+
+with chain_tab:
+    st.markdown('<div class="yzy-title"><h1>YZY BLOCKCHAIN</h1><h2>COMING SOON</h2></div>', unsafe_allow_html=True)
+    try:
+        st.image('soon.png', use_container_width=True)
+    except Exception:
+        st.info('soon.png not found ')
