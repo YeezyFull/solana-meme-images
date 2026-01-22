@@ -4,6 +4,7 @@ import math
 import html
 import base64
 import asyncio
+import datetime as dt
 from typing import Dict, Any, Optional, Tuple, List
 
 import pandas as pd
@@ -511,100 +512,126 @@ try:
 except Exception as e:
     st.error(f"Couldn't load {DATA_FILE}. Put it next to app.py. Error: {e}")
     st.stop()
+# Read optional date from URL query params (e.g. ?date=2026-01-01)
+_default_date = None
+try:
+    _qp = st.query_params
+    _qdate = _qp.get("date")
+    if isinstance(_qdate, list):
+        _qdate = _qdate[0] if _qdate else None
+except Exception:
+    _qp = st.experimental_get_query_params()  # type: ignore[attr-defined]
+    _qdate = (_qp.get("date") or [None])[0]
+if _qdate:
+    try:
+        _default_date = dt.date.fromisoformat(str(_qdate))
+    except Exception:
+        _default_date = None
 
-cA, cB, cC, cD = st.columns([2.2, 2.2, 3.2, 2.4])
-with cA:
-    sort_mode = st.selectbox("Sort", options=["Newest", "Oldest"], index=0)
-with cB:
-    show_only_images = st.checkbox("Show only tokens with images", value=False)
-with cC:
-    picked_date = st.date_input("Mint date (optional)", value=None, help="Pick a day to show tokens minted that day.")
-with cD:
-    page = st.number_input("Page", min_value=1, max_value=999999, value=1, step=1)
+archive_tab, stats_tab = st.tabs(["Archive", "Statistic"])
 
-search_q = st.text_input("Search (symbol / name / CA)", value="", placeholder="Search token…")
+with archive_tab:
+    cA, cB, cC, cD = st.columns([2.2, 2.2, 3.2, 2.4])
+    with cA:
+        sort_mode = st.selectbox("Sort", options=["Newest", "Oldest"], index=0)
+    with cB:
+        show_only_images = st.checkbox("Show only tokens with images", value=False)
+    with cC:
+        picked_date = st.date_input("Mint date (optional)", value=_default_date, help="Pick a day to show tokens minted that day.", key="mint_date_picker")
+    with cD:
+        page = st.number_input("Page", min_value=1, max_value=999999, value=1, step=1)
 
-f = df.copy()
-if search_q.strip():
-    q = search_q.strip().lower()
-    f = f[
-        f["symbol"].str.lower().str.contains(q)
-        | f["name"].str.lower().str.contains(q)
-        | f["ca"].str.lower().str.contains(q)
-    ]
-if picked_date is not None:
-    f = f[f["mint_date"] == picked_date]
-if show_only_images:
-    f = f[f["image_url"].astype(str).str.strip() != ""]
+    # If user cleared the date picker that was prefilled from URL, drop the query param so it doesn't come back.
+    if _qdate and picked_date is None:
+        try:
+            st.query_params.pop("date", None)
+        except Exception:
+            st.experimental_set_query_params()  # type: ignore[attr-defined]
+        st.rerun()
 
-if sort_mode == "Newest":
-    f = f.sort_values(by=["mint_dt", "mint_time"], ascending=False)
-else:
-    f = f.sort_values(by=["mint_dt", "mint_time"], ascending=True)
+    search_q = st.text_input("Search (symbol / name / CA)", value="", placeholder="Search token…")
 
-f = f.reset_index(drop=True)
-total = len(f)
-pages = max(1, math.ceil(total / PAGE_SIZE))
-page = max(1, min(int(page), pages))
+    f = df.copy()
+    if search_q.strip():
+        q = search_q.strip().lower()
+        f = f[
+            f["symbol"].str.lower().str.contains(q)
+            | f["name"].str.lower().str.contains(q)
+            | f["ca"].str.lower().str.contains(q)
+        ]
+    if picked_date is not None:
+        f = f[f["mint_date"] == picked_date]
+    if show_only_images:
+        f = f[f["image_url"].astype(str).str.strip() != ""]
 
-st.markdown(f'<div class="smallcap">Total tokens: <b>{total:,}</b> • Page: <b>{page:,}/{pages:,}</b> • Items per page: <b>{PAGE_SIZE}</b></div>', unsafe_allow_html=True)
+    if sort_mode == "Newest":
+        f = f.sort_values(by=["mint_dt", "mint_time"], ascending=False)
+    else:
+        f = f.sort_values(by=["mint_dt", "mint_time"], ascending=True)
 
-start = (page - 1) * PAGE_SIZE
-end = min(start + PAGE_SIZE, total)
-page_df = f.iloc[start:end].copy()
+    f = f.reset_index(drop=True)
+    total = len(f)
+    pages = max(1, math.ceil(total / PAGE_SIZE))
+    page = max(1, min(int(page), pages))
 
-missing = page_df[page_df["image_url"].astype(str).str.strip() == ""]["ca"].tolist()
-helius_map: Dict[str, Dict[str, Any]] = {}
-if missing:
-    with st.spinner(f"Fetching missing images from Helius ({len(missing)})…"):
-        helius_map = helius_get_asset_batch(missing)
+    st.markdown(f'<div class="smallcap">Total tokens: <b>{total:,}</b> • Page: <b>{page:,}/{pages:,}</b> • Items per page: <b>{PAGE_SIZE}</b></div>', unsafe_allow_html=True)
 
-still_missing = []
-for m in missing:
-    img = normalize_url(nonempty_str((helius_map.get(m) or {}).get("image")))
-    if not img:
-        still_missing.append(m)
+    start = (page - 1) * PAGE_SIZE
+    end = min(start + PAGE_SIZE, total)
+    page_df = f.iloc[start:end].copy()
 
-metaplex_map: Dict[str, Dict[str, Any]] = {}
-if still_missing:
-    with st.spinner(f"Trying Metaplex on-chain metadata ({len(still_missing)})…"):
-        metaplex_map = metaplex_resolve_images(still_missing)
+    missing = page_df[page_df["image_url"].astype(str).str.strip() == ""]["ca"].tolist()
+    helius_map: Dict[str, Dict[str, Any]] = {}
+    if missing:
+        with st.spinner(f"Fetching missing images from Helius ({len(missing)})…"):
+            helius_map = helius_get_asset_batch(missing)
 
-items = page_df.to_dict(orient="records")
-
-for r in range(0, len(items), COLS):
-    cols = st.columns(COLS)
-    for j in range(COLS):
-        idx = r + j
-        if idx >= len(items):
-            continue
-        it = items[idx]
-
-        ca = str(it.get("ca", "")).strip()
-        sym = str(it.get("symbol", "")).strip()
-        nm = str(it.get("name", "")).strip()
-        mint_time = str(it.get("mint_time", "")).strip()
-
-        img = normalize_url(nonempty_str(it.get("image_url", "")))
-
-        reason = "Image failed to load"
+    still_missing = []
+    for m in missing:
+        img = normalize_url(nonempty_str((helius_map.get(m) or {}).get("image")))
         if not img:
-            img = normalize_url(nonempty_str((helius_map.get(ca) or {}).get("image")))
-            reason = (helius_map.get(ca) or {}).get("reason") or reason
+            still_missing.append(m)
 
+    metaplex_map: Dict[str, Dict[str, Any]] = {}
+    if still_missing:
+        with st.spinner(f"Trying Metaplex on-chain metadata ({len(still_missing)})…"):
+            metaplex_map = metaplex_resolve_images(still_missing)
+
+    items = page_df.to_dict(orient="records")
+
+    for r in range(0, len(items), COLS):
+        cols = st.columns(COLS)
+        for j in range(COLS):
+            idx = r + j
+            if idx >= len(items):
+                continue
+            it = items[idx]
+
+            ca = str(it.get("ca", "")).strip()
+            sym = str(it.get("symbol", "")).strip()
+            nm = str(it.get("name", "")).strip()
+            mint_time = str(it.get("mint_time", "")).strip()
+
+            img = normalize_url(nonempty_str(it.get("image_url", "")))
+
+            reason = "Image failed to load"
             if not img:
-                img = normalize_url(nonempty_str((metaplex_map.get(ca) or {}).get("image")))
-                reason = (metaplex_map.get(ca) or {}).get("reason") or reason
+                img = normalize_url(nonempty_str((helius_map.get(ca) or {}).get("image")))
+                reason = (helius_map.get(ca) or {}).get("reason") or reason
 
-            if not img:
-                reason = "No image URL in list (Helius + Metaplex failed)"
-        else:
-            if is_local_sent(img):
-                reason = "Image replaced locally"
+                if not img:
+                    img = normalize_url(nonempty_str((metaplex_map.get(ca) or {}).get("image")))
+                    reason = (metaplex_map.get(ca) or {}).get("reason") or reason
 
-        key = f"{page}_{idx}"
+                if not img:
+                    reason = "No image URL in list (Helius + Metaplex failed)"
+            else:
+                if is_local_sent(img):
+                    reason = "Image replaced locally"
 
-        card_html = f"""
+            key = f"{page}_{idx}"
+
+            card_html = f"""
 <div class="token-card">
   <div class="token-top">
     <div>
@@ -619,7 +646,54 @@ for r in range(0, len(items), COLS):
   </div>
 </div>
 """
-        with cols[j]:
-            st.markdown(card_html, unsafe_allow_html=True)
-            components.html(copy_button_html(ca, key=f"{key}_{j}"), height=44)
-            st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
+            with cols[j]:
+                st.markdown(card_html, unsafe_allow_html=True)
+                components.html(copy_button_html(ca, key=f"{key}_{j}"), height=44)
+                st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
+
+# ============================
+# STATISTICS TAB
+# ============================
+with stats_tab:
+    years = sorted([int(y) for y in df["mint_dt"].dropna().dt.year.unique().tolist()])
+    if not years:
+        st.info("No mint dates available to build statistics.")
+    else:
+        default_year = years[-1]
+        sel_year = st.selectbox("Year", options=years, index=years.index(default_year))
+
+        ydf = df[df["mint_dt"].dt.year == int(sel_year)].copy()
+        ydf = ydf.dropna(subset=["mint_dt"])
+
+        daily = ydf["mint_dt"].dt.date.value_counts()
+        daily = daily.sort_index()
+
+        start_day = pd.Timestamp(dt.date(int(sel_year), 1, 1))
+        end_day = pd.Timestamp(dt.date(int(sel_year), 12, 31))
+        all_days = pd.date_range(start_day, end_day, freq="D").date
+
+        daily = daily.reindex(all_days, fill_value=0)
+
+        chart_df = pd.DataFrame({"date": list(all_days), "tokens": daily.values}).set_index("date")
+
+        st.markdown(f'<div class="smallcap">Tokens minted per day in <b>{int(sel_year)}</b></div>', unsafe_allow_html=True)
+        st.line_chart(chart_df)
+
+        top10 = daily.sort_values(ascending=False).head(10)
+        st.markdown('<div style="height:8px"></div>', unsafe_allow_html=True)
+        st.markdown('<div class="smallcap"><b>Top 10 days</b> (click to open the Archive filtered to that day)</div>', unsafe_allow_html=True)
+
+        for d, cnt in top10.items():
+            ds = d.isoformat()
+            row_html = f'''
+<div class="token-card" style="padding:12px 12px;">
+  <div class="token-meta" style="margin-top:0;">
+    <div class="token-ca" style="font-weight:700;">{html.escape(ds)}</div>
+    <div class="token-date" style="font-weight:700;">{int(cnt)} tokens</div>
+  </div>
+  <div style="margin-top:10px;">
+    <a class="copy-btn" style="display:inline-block; text-decoration:none; text-align:center;" href="?date={html.escape(ds)}" target="_self">Open this day</a>
+  </div>
+</div>
+'''
+            st.markdown(row_html, unsafe_allow_html=True)
